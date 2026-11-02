@@ -79,6 +79,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "nav_msgs/msg/odometry.hpp"
+#include "std_msgs/msg/u_int32.hpp"
+#include <pcl/point_types.h>
+#include <mutex>
 
 namespace octomap_server
 {
@@ -101,6 +105,7 @@ public:
   using PCLPointCloud = pcl::PointCloud<pcl::PointXYZ>;
   using OcTreeT = octomap::OcTree;
 #endif
+  using DeltaPointCloud = pcl::PointCloud<pcl::PointXYZI>;
   using OctomapSrv = octomap_msgs::srv::GetOctomap;
   using BBoxSrv = octomap_msgs::srv::BoundingBoxQuery;
   using ResetSrv = std_srvs::srv::Empty;
@@ -121,6 +126,7 @@ public:
 
   virtual void insertCloudCallback(const PointCloud2::ConstSharedPtr cloud);
   virtual bool openFile(const std::string & filename);
+  void odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
 
 protected:
   inline static void updateMinKey(const octomap::OcTreeKey & in, octomap::OcTreeKey & min)
@@ -155,6 +161,12 @@ protected:
   void publishBinaryOctoMap(const rclcpp::Time & rostime) const;
   void publishFullOctoMap(const rclcpp::Time & rostime) const;
   virtual void publishAll(const rclcpp::Time & rostime);
+  /// update one voxel; when `track` is set, record added / removed / changed voxels
+  void updateNodeTracked(const octomap::OcTreeKey & key, bool occupied, bool track);
+  bool deltaWanted() const;
+  void publishDelta(const rclcpp::Time & rostime);
+  /// something happened that deltas cannot express (reset, clear_bbox, file load)
+  void bumpDeltaEpoch();
 
   /**
   * @brief update occupancy map with a scan labeled as ground and nonground.
@@ -284,6 +296,28 @@ protected:
   double point_cloud_max_z_;
   double occupancy_min_z_;
   double occupancy_max_z_;
+  // --- dynamic z slice for the 2D projection ---
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  bool dynamic_z_range_{false};
+  double occupancy_z_offset_min_{-0.3};
+  double occupancy_z_offset_max_{0.3};
+  std::mutex slice_mutex_;
+  double slice_min_z_{0.0};
+  double slice_max_z_{0.0};
+  bool slice_valid_{false};
+
+  // --- change tracking (added / removed / changed voxels) ---
+  bool publish_delta_{false};
+  double delta_changed_min_logodds_{0.0};
+  uint32_t delta_epoch_{0};
+  DeltaPointCloud delta_added_;
+  DeltaPointCloud delta_removed_;
+  DeltaPointCloud delta_changed_;
+  rclcpp::Publisher<PointCloud2>::SharedPtr delta_added_pub_;
+  rclcpp::Publisher<PointCloud2>::SharedPtr delta_removed_pub_;
+  rclcpp::Publisher<PointCloud2>::SharedPtr delta_changed_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr delta_epoch_pub_;
+
   double min_x_size_;
   double min_y_size_;
   bool filter_speckles_;

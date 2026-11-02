@@ -109,6 +109,14 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
     occupancy_max_z_desc.floating_point_range.push_back(occupancy_max_z_range);
     occupancy_max_z_ = declare_parameter("occupancy_max_z", 100.0, occupancy_max_z_desc);
   }
+
+  dynamic_z_range_ = declare_parameter("dynamic_z_range", false);
+  occupancy_z_offset_min_ = declare_parameter("occupancy_z_offset_min", -0.3);
+  occupancy_z_offset_max_ = declare_parameter("occupancy_z_offset_max", 0.3);
+  const std::string odom_topic = declare_parameter("odom_topic", "/Odometry");
+
+  publish_delta_ = declare_parameter("publish_delta", false);
+  delta_changed_min_logodds_ = declare_parameter("delta_changed_min_logodds", 0.0);
   min_x_size_ = declare_parameter("min_x_size", 0.0);
   min_y_size_ = declare_parameter("min_y_size", 0.0);
 
@@ -299,6 +307,16 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   point_cloud_pub_ = create_publisher<PointCloud2>("octomap_point_cloud_centers", qos);
   map_pub_ = create_publisher<OccupancyGrid>("projected_map", qos.keep_last(5));
   fmarker_pub_ = create_publisher<MarkerArray>("free_cells_vis_array", qos);
+  delta_added_pub_ = create_publisher<PointCloud2>("octomap_delta_added", rclcpp::QoS(10));
+  delta_removed_pub_ = create_publisher<PointCloud2>("octomap_delta_removed", rclcpp::QoS(10));
+  delta_changed_pub_ = create_publisher<PointCloud2>("octomap_delta_changed", rclcpp::QoS(10));
+  delta_epoch_pub_ = create_publisher<std_msgs::msg::UInt32>(
+    "octomap_delta_epoch", rclcpp::QoS{1}.transient_local());
+  {
+    std_msgs::msg::UInt32 epoch_msg;
+    epoch_msg.data = delta_epoch_;
+    delta_epoch_pub_->publish(epoch_msg);
+  }
 
   tf2_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   auto timer_interface = std::make_shared<tf2_ros::CreateTimerROS>(
@@ -307,6 +325,9 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   tf2_buffer_->setCreateTimerInterface(timer_interface);
   tf2_listener_ =
     std::make_shared<tf2_ros::TransformListener>(*tf2_buffer_);
+  odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+    odom_topic, rclcpp::SensorDataQoS(),
+    std::bind(&OctomapServer::odometryCallback, this, _1));
 
   using std::chrono_literals::operator""s;
 #ifdef USE_OLD_RMW_QOS_MESSAGE_FILTERS
@@ -392,6 +413,7 @@ bool OctomapServer::openFile(const std::string & filename)
   update_bbox_max_[1] = octree_->coordToKey(max_y);
   update_bbox_max_[2] = octree_->coordToKey(max_z);
 
+  bumpDeltaEpoch();   // CHANGED: a loaded file cannot be expressed as deltas
   publishAll(now());
 
   return true;
@@ -569,16 +591,19 @@ void OctomapServer::insertScan(
     }
   }
 
+  // CHANGED: decide once per scan whether changes are recorded
+  const bool track_delta = deltaWanted();
+
   // mark free cells only if not seen occupied in this cloud
   for (auto it = free_cells.begin(), end = free_cells.end(); it != end; ++it) {
     if (occupied_cells.find(*it) == occupied_cells.end()) {
-      octree_->updateNode(*it, false);
+      updateNodeTracked(*it, false, track_delta);
     }
   }
 
   // now mark all occupied cells:
   for (auto it = occupied_cells.begin(), end = occupied_cells.end(); it != end; it++) {
-    octree_->updateNode(*it, true);
+    updateNodeTracked(*it, true, track_delta);
   }
 
   // TODO(someone): eval lazy+updateInner vs. proper insertion
@@ -631,6 +656,17 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
   if (octomap_size <= 1) {
     RCLCPP_WARN(get_logger(), "Nothing to publish, octree is empty");
     return;
+  }
+
+  // CHANGED: z range used for the 2D projection only
+  double slice_min_z = occupancy_min_z_;      // static fallback
+  double slice_max_z = occupancy_max_z_;
+  if (dynamic_z_range_) {
+    std::lock_guard<std::mutex> lock(slice_mutex_);
+    if (slice_valid_) {
+      slice_min_z = slice_min_z_;
+      slice_max_z = slice_max_z_;
+    }
   }
 
   bool publish_free_marker_array_ = publish_free_space_ &&
@@ -688,92 +724,91 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
       handleNodeInBBX(it);
     }
 
+    // CHANGED: computed once; it now gates ONLY the 2D projection
+    const double z = it.getZ();
+    const double half_size = it.getSize() / 2.0;
+    const bool in_slice = (z + half_size > slice_min_z) && (z - half_size < slice_max_z);
     if (octree_->isNodeOccupied(*it)) {
-      double z = it.getZ();
-      double half_size = it.getSize() / 2.0;
-      if (z + half_size > occupancy_min_z_ && z - half_size < occupancy_max_z_) {
-        double x = it.getX();
-        double y = it.getY();
+      double x = it.getX();
+      double y = it.getY();
 #ifdef COLOR_OCTOMAP_SERVER
-        int r = it->getColor().r;
-        int g = it->getColor().g;
-        int b = it->getColor().b;
+      int r = it->getColor().r;
+      int g = it->getColor().g;
+      int b = it->getColor().b;
 #endif
 
-        // Ignore speckles in the map:
-        if (filter_speckles_ && (it.getDepth() == tree_depth_ + 1) && isSpeckleNode(it.getKey())) {
-          RCLCPP_DEBUG(get_logger(), "Ignoring single speckle at (%f,%f,%f)", x, y, z);
-          continue;
-        }  // else: current octree node is no speckle, send it out
+      // Ignore speckles in the map:
+      if (filter_speckles_ && (it.getDepth() == tree_depth_ + 1) && isSpeckleNode(it.getKey())) {
+        RCLCPP_DEBUG(get_logger(), "Ignoring single speckle at (%f,%f,%f)", x, y, z);
+        continue;
+      }  // else: current octree node is no speckle, send it out
 
+      if (in_slice) {  // CHANGED
         handleOccupiedNode(it);
         if (in_update_bbox) {
           handleOccupiedNodeInBBX(it);
         }
+      }
 
+      // create marker:
+      if (publish_marker_array) {
+        unsigned idx = it.getDepth();
+        assert(idx < occupied_nodes_vis.markers.size());
 
-        // create marker:
-        if (publish_marker_array) {
-          unsigned idx = it.getDepth();
-          assert(idx < occupied_nodes_vis.markers.size());
+        geometry_msgs::msg::Point cube_center;
+        cube_center.x = x;
+        cube_center.y = y;
+        cube_center.z = z;
 
-          geometry_msgs::msg::Point cube_center;
-          cube_center.x = x;
-          cube_center.y = y;
-          cube_center.z = z;
+        occupied_nodes_vis.markers[idx].points.push_back(cube_center);
+        if (use_height_map_) {
+          double min_x{};
+          double min_y{};
+          double min_z{};
+          double max_x{};
+          double max_y{};
+          double max_z{};
+          octree_->getMetricMin(min_x, min_y, min_z);
+          octree_->getMetricMax(max_x, max_y, max_z);
 
-          occupied_nodes_vis.markers[idx].points.push_back(cube_center);
-          if (use_height_map_) {
-            double min_x{};
-            double min_y{};
-            double min_z{};
-            double max_x{};
-            double max_y{};
-            double max_z{};
-            octree_->getMetricMin(min_x, min_y, min_z);
-            octree_->getMetricMax(max_x, max_y, max_z);
-
-            double h =
-              (1.0 -
-              std::min(
-                std::max((cube_center.z - min_z) / (max_z - min_z), 0.0),
-                1.0)) * color_factor_;
-            occupied_nodes_vis.markers[idx].colors.push_back(heightMapColor(h));
-          }
-
-#ifdef COLOR_OCTOMAP_SERVER
-          if (use_colored_map_) {
-            ColorRGBA _color;
-            _color.r = (r / 255.);
-            _color.g = (g / 255.);
-            _color.b = (b / 255.);
-            // TODO(someone): EVALUATE: potentially use occupancy as measure for alpha channel?
-            _color.a = 1.0;
-            occupied_nodes_vis.markers[idx].colors.push_back(_color);
-          }
-#endif
+          double h =
+            (1.0 -
+            std::min(
+              std::max((cube_center.z - min_z) / (max_z - min_z), 0.0),
+              1.0)) * color_factor_;
+          occupied_nodes_vis.markers[idx].colors.push_back(heightMapColor(h));
         }
 
-        // insert into pointcloud:
-        if (publish_point_cloud) {
 #ifdef COLOR_OCTOMAP_SERVER
-          PCLPoint _point = PCLPoint();
-          _point.x = x;
-          _point.y = y;
-          _point.z = z;
-          _point.r = r;
-          _point.g = g;
-          _point.b = b;
-          pcl_cloud.push_back(_point);
+        if (use_colored_map_) {
+          ColorRGBA _color;
+          _color.r = (r / 255.);
+          _color.g = (g / 255.);
+          _color.b = (b / 255.);
+          // TODO(someone): EVALUATE: potentially use occupancy as measure for alpha channel?
+          _color.a = 1.0;
+          occupied_nodes_vis.markers[idx].colors.push_back(_color);
+        }
+#endif
+      }
+
+      // insert into pointcloud:
+      if (publish_point_cloud) {
+#ifdef COLOR_OCTOMAP_SERVER
+        PCLPoint _point = PCLPoint();
+        _point.x = x;
+        _point.y = y;
+        _point.z = z;
+        _point.r = r;
+        _point.g = g;
+        _point.b = b;
+        pcl_cloud.push_back(_point);
 #else
-          pcl_cloud.push_back(PCLPoint(x, y, z));
+        pcl_cloud.push_back(PCLPoint(x, y, z));
 #endif
-        }
       }
     } else {  // node not occupied => mark as free in 2D map if unknown so far
-      double z = it.getZ();
-      double half_size = it.getSize() / 2.0;
-      if (z + half_size > occupancy_min_z_ && z - half_size < occupancy_max_z_) {
+      if (in_slice) {                                   // CHANGED
         handleFreeNode(it);
         if (in_update_bbox) {
           handleFreeNodeInBBX(it);
@@ -873,6 +908,7 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
   if (publish_full_map) {
     publishFullOctoMap(rostime);
   }
+  publishDelta(rostime);   // CHANGED
   double total_elapsed = (rclcpp::Clock{}.now() - start_time).seconds();
   RCLCPP_DEBUG(get_logger(), "Map publishing in OctomapServer took %f sec", total_elapsed);
 }
@@ -926,7 +962,7 @@ bool OctomapServer::clearBBoxSrv(
   }
   // TODO(someone): eval which is faster (setLogOdds+updateInner or updateNode)
   octree_->updateInnerOccupancy();
-
+  bumpDeltaEpoch();   // CHANGED
   publishAll(now());
 
   return true;
@@ -940,6 +976,7 @@ bool OctomapServer::resetSrv(
   occupied_nodes_vis.markers.resize(tree_depth_ + 1);
   const auto rostime = now();
   octree_->clear();
+  bumpDeltaEpoch();   // CHANGED
   // clear 2D map:
   gridmap_.data.clear();
   gridmap_.info.height = 0.0;
@@ -1205,7 +1242,9 @@ void OctomapServer::handlePreNodeTraversal(const rclcpp::Time & rostime)
     if (max_tree_depth_ < tree_depth_) {
       project_complete_map_ = true;
     }
-
+    if (dynamic_z_range_) {
+      project_complete_map_ = true;   // CHANGED: a moving slice needs a full re-projection
+    }
     if (project_complete_map_) {
       RCLCPP_DEBUG(get_logger(), "Rebuilding complete 2D map");
       gridmap_.data.clear();
@@ -1370,6 +1409,11 @@ rcl_interfaces::msg::SetParametersResult OctomapServer::onParameter(
   update_param(parameters, "ground_filter_angle", ground_filter_angle_);
   update_param(parameters, "ground_filter_plane_distance", ground_filter_plane_distance_);
   update_param(parameters, "sensor_model.max_range", max_range_);
+  update_param(parameters, "dynamic_z_range", dynamic_z_range_);
+  update_param(parameters, "occupancy_z_offset_min", occupancy_z_offset_min_);
+  update_param(parameters, "occupancy_z_offset_max", occupancy_z_offset_max_);
+  update_param(parameters, "publish_delta", publish_delta_);
+  update_param(parameters, "delta_changed_min_logodds", delta_changed_min_logodds_);
   double sensor_model_min{get_parameter("sensor_model.min").as_double()};
   update_param(parameters, "sensor_model.min", sensor_model_min);
   octree_->setClampingThresMin(sensor_model_min);
@@ -1485,6 +1529,115 @@ ColorRGBA OctomapServer::heightMapColor(double h)
   }
 
   return color;
+}
+
+void OctomapServer::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
+{
+  if (!dynamic_z_range_) {
+    return;
+  }
+  geometry_msgs::msg::PointStamped p_in, p_out;
+  p_in.header = msg->header;
+  p_in.point = msg->pose.pose.position;
+  if (msg->header.frame_id == world_frame_id_) {
+    p_out = p_in;
+  } else {
+    try {
+      const auto tf = tf2_buffer_->lookupTransform(
+        world_frame_id_, msg->header.frame_id, tf2::TimePointZero);
+      tf2::doTransform(p_in, p_out, tf);
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "odom->world: %s", ex.what());
+      return;
+    }
+  }
+  std::lock_guard<std::mutex> lock(slice_mutex_);
+  slice_min_z_ = p_out.point.z + occupancy_z_offset_min_;
+  slice_max_z_ = p_out.point.z + occupancy_z_offset_max_;
+  slice_valid_ = true;
+}
+
+bool OctomapServer::deltaWanted() const
+{
+  return publish_delta_ &&
+         (delta_added_pub_->get_subscription_count() +
+          delta_added_pub_->get_intra_process_subscription_count() +
+          delta_removed_pub_->get_subscription_count() +
+          delta_removed_pub_->get_intra_process_subscription_count() +
+          delta_changed_pub_->get_subscription_count() +
+          delta_changed_pub_->get_intra_process_subscription_count() > 0);
+}
+
+void OctomapServer::updateNodeTracked(
+  const octomap::OcTreeKey & key, bool occupied, bool track)
+{
+  if (!track) {
+    octree_->updateNode(key, occupied);
+    return;
+  }
+
+  // copy what we need BEFORE the update (the node can be pruned / replaced by it)
+  const auto old_node = octree_->search(key);
+  const bool was_occupied = (old_node != nullptr) && octree_->isNodeOccupied(old_node);
+  const float old_logodds = (old_node != nullptr) ? old_node->getLogOdds() : 0.0f;
+
+  const auto new_node = octree_->updateNode(key, occupied);
+  if (new_node == nullptr) {
+    return;
+  }
+  const bool is_occupied = octree_->isNodeOccupied(new_node);
+
+  pcl::PointXYZI p;
+  const octomap::point3d c = octree_->keyToCoord(key);   // centre of the finest voxel
+  p.x = c.x();
+  p.y = c.y();
+  p.z = c.z();
+  p.intensity = new_node->getOccupancy();                // occupancy probability after update
+
+  if (!was_occupied && is_occupied) {
+    delta_added_.push_back(p);
+  } else if (was_occupied && !is_occupied) {
+    delta_removed_.push_back(p);
+  } else if (was_occupied && is_occupied &&
+    std::abs(new_node->getLogOdds() - old_logodds) > delta_changed_min_logodds_)
+  {
+    delta_changed_.push_back(p);
+  }
+}
+
+void OctomapServer::publishDelta(const rclcpp::Time & rostime)
+{
+  const bool empty =
+    delta_added_.empty() && delta_removed_.empty() && delta_changed_.empty();
+  if (!publish_delta_ || empty) {
+    delta_added_.clear();
+    delta_removed_.clear();
+    delta_changed_.clear();
+    return;
+  }
+  auto publish_and_clear =
+    [&](const rclcpp::Publisher<PointCloud2>::SharedPtr & pub, DeltaPointCloud & cloud) {
+      PointCloud2 msg;
+      pcl::toROSMsg(cloud, msg);
+      msg.header.frame_id = world_frame_id_;
+      msg.header.stamp = rostime;
+      pub->publish(msg);
+      cloud.clear();
+    };
+  publish_and_clear(delta_added_pub_, delta_added_);
+  publish_and_clear(delta_removed_pub_, delta_removed_);
+  publish_and_clear(delta_changed_pub_, delta_changed_);
+}
+
+void OctomapServer::bumpDeltaEpoch()
+{
+  delta_added_.clear();
+  delta_removed_.clear();
+  delta_changed_.clear();
+  ++delta_epoch_;
+  std_msgs::msg::UInt32 msg;
+  msg.data = delta_epoch_;
+  delta_epoch_pub_->publish(msg);
 }
 
 #ifdef COLOR_OCTOMAP_SERVER
