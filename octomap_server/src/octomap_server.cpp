@@ -36,6 +36,7 @@
 
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 
 namespace
 {
@@ -114,6 +115,14 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   occupancy_z_offset_min_ = declare_parameter("occupancy_z_offset_min", -0.3);
   occupancy_z_offset_max_ = declare_parameter("occupancy_z_offset_max", 0.3);
   const std::string odom_topic = declare_parameter("odom_topic", "/Odometry");
+  const std::string nav2_global_in = declare_parameter("nav2_global_cloud_in", "");
+  const std::string nav2_local_in = declare_parameter("nav2_local_cloud_in", "");
+  nav2_crop_relative_to_odom_ = declare_parameter("nav2_crop_relative_to_odom", true);
+  nav2_z_offset_min_ = declare_parameter("nav2_z_offset_min", -0.3);
+  nav2_z_offset_max_ = declare_parameter("nav2_z_offset_max", 0.3);
+  nav2_min_z_ = declare_parameter("nav2_min_z", -100.0);
+  nav2_max_z_ = declare_parameter("nav2_max_z", 100.0);
+  nav2_enabled_ = !nav2_global_in.empty() || !nav2_local_in.empty();
 
   publish_delta_ = declare_parameter("publish_delta", false);
   delta_changed_min_logodds_ = declare_parameter("delta_changed_min_logodds", 0.0);
@@ -328,7 +337,24 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
     odom_topic, rclcpp::SensorDataQoS(),
     std::bind(&OctomapServer::odometryCallback, this, _1));
-
+  nav2_global_pub_ = create_publisher<PointCloud2>(
+    "nav2_global_cloud", rclcpp::SensorDataQoS().reliable());
+  nav2_local_pub_ = create_publisher<PointCloud2>(
+    "nav2_local_cloud", rclcpp::SensorDataQoS().reliable());
+  if (!nav2_global_in.empty()) {
+    nav2_global_sub_ = create_subscription<PointCloud2>(
+      nav2_global_in, rclcpp::SensorDataQoS(),
+      [this](const PointCloud2::ConstSharedPtr msg) {
+        cropCloudForNav2(*msg, nav2_global_pub_);
+      });
+  }
+  if (!nav2_local_in.empty()) {
+    nav2_local_sub_ = create_subscription<PointCloud2>(
+      nav2_local_in, rclcpp::SensorDataQoS(),
+      [this](const PointCloud2::ConstSharedPtr msg) {
+        cropCloudForNav2(*msg, nav2_local_pub_);
+      });
+  }
   using std::chrono_literals::operator""s;
 #ifdef USE_OLD_RMW_QOS_MESSAGE_FILTERS
   point_cloud_sub_.subscribe(this, "cloud_in", rmw_qos_profile_sensor_data);
@@ -1414,6 +1440,11 @@ rcl_interfaces::msg::SetParametersResult OctomapServer::onParameter(
   update_param(parameters, "occupancy_z_offset_max", occupancy_z_offset_max_);
   update_param(parameters, "publish_delta", publish_delta_);
   update_param(parameters, "delta_changed_min_logodds", delta_changed_min_logodds_);
+  update_param(parameters, "nav2_crop_relative_to_odom", nav2_crop_relative_to_odom_);
+  update_param(parameters, "nav2_z_offset_min", nav2_z_offset_min_);
+  update_param(parameters, "nav2_z_offset_max", nav2_z_offset_max_);
+  update_param(parameters, "nav2_min_z", nav2_min_z_);
+  update_param(parameters, "nav2_max_z", nav2_max_z_);
   double sensor_model_min{get_parameter("sensor_model.min").as_double()};
   update_param(parameters, "sensor_model.min", sensor_model_min);
   octree_->setClampingThresMin(sensor_model_min);
@@ -1533,7 +1564,7 @@ ColorRGBA OctomapServer::heightMapColor(double h)
 
 void OctomapServer::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
 {
-  if (!dynamic_z_range_) {
+  if (!dynamic_z_range_ && !nav2_enabled_) {
     return;
   }
   geometry_msgs::msg::PointStamped p_in, p_out;
@@ -1552,9 +1583,13 @@ void OctomapServer::odometryCallback(const nav_msgs::msg::Odometry::ConstSharedP
     }
   }
   std::lock_guard<std::mutex> lock(slice_mutex_);
-  slice_min_z_ = p_out.point.z + occupancy_z_offset_min_;
-  slice_max_z_ = p_out.point.z + occupancy_z_offset_max_;
-  slice_valid_ = true;
+  odom_z_ = p_out.point.z;
+  odom_valid_ = true;
+  if (dynamic_z_range_) {
+    slice_min_z_ = odom_z_ + occupancy_z_offset_min_;
+    slice_max_z_ = odom_z_ + occupancy_z_offset_max_;
+    slice_valid_ = true;
+  }
 }
 
 bool OctomapServer::deltaWanted() const
@@ -1638,6 +1673,90 @@ void OctomapServer::bumpDeltaEpoch()
   std_msgs::msg::UInt32 msg;
   msg.data = delta_epoch_;
   delta_epoch_pub_->publish(msg);
+}
+
+void OctomapServer::cropCloudForNav2(
+  const PointCloud2 & in, const rclcpp::Publisher<PointCloud2>::SharedPtr & pub)
+{
+  if (pub->get_subscription_count() + pub->get_intra_process_subscription_count() == 0) {
+    return;
+  }
+
+  // z limits in the world frame
+  double z_lo = 0.0;
+  double z_hi = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(slice_mutex_);
+    if (nav2_crop_relative_to_odom_) {
+      if (!odom_valid_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "nav2 crop: no odometry received yet, not publishing");
+        return;
+      }
+      z_lo = odom_z_ + nav2_z_offset_min_;
+      z_hi = odom_z_ + nav2_z_offset_max_;
+    } else {
+      z_lo = nav2_min_z_;
+      z_hi = nav2_max_z_;
+    }
+  }
+
+  // world z of a point p in the cloud frame:  z_w = row . p + tz
+  Eigen::Vector3d row = Eigen::Vector3d::UnitZ();
+  double tz = 0.0;
+  if (in.header.frame_id != world_frame_id_) {
+    geometry_msgs::msg::TransformStamped tf;
+    try {
+      tf = tf2_buffer_->lookupTransform(
+        world_frame_id_, in.header.frame_id, rclcpp::Time(in.header.stamp));
+    } catch (const tf2::TransformException &) {
+      try {  // stamp not available yet: use the latest transform
+        tf = tf2_buffer_->lookupTransform(
+          world_frame_id_, in.header.frame_id, tf2::TimePointZero);
+      } catch (const tf2::TransformException & ex) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000, "nav2 crop: %s", ex.what());
+        return;
+      }
+    }
+    const Eigen::Isometry3d T = tf2::transformToEigen(tf);
+    row = T.linear().row(2).transpose();
+    tz = T.translation().z();
+  }
+
+  PointCloud2 out;
+  out.header = in.header;          // frame and stamp unchanged
+  out.fields = in.fields;
+  out.is_bigendian = in.is_bigendian;
+  out.point_step = in.point_step;
+  out.height = 1;
+  out.is_dense = true;             // NaN points never pass the test below
+
+  const size_t n_points = static_cast<size_t>(in.width) * in.height;
+  size_t kept = 0;
+  try {
+    sensor_msgs::PointCloud2ConstIterator<float> ix(in, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> iy(in, "y");
+    sensor_msgs::PointCloud2ConstIterator<float> iz(in, "z");
+    for (size_t i = 0; i < n_points; ++i, ++ix, ++iy, ++iz) {
+      const double z_world = row.x() * *ix + row.y() * *iy + row.z() * *iz + tz;
+      if (!(z_world >= z_lo && z_world <= z_hi)) {
+        continue;
+      }
+      const uint8_t * p = in.data.data() + i * in.point_step;
+      out.data.insert(out.data.end(), p, p + in.point_step);
+      ++kept;
+    }
+  } catch (const std::runtime_error & e) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "nav2 crop: cloud needs float32 x, y, z fields (%s)", e.what());
+    return;
+  }
+  out.width = static_cast<uint32_t>(kept);
+  out.row_step = out.width * out.point_step;
+  pub->publish(out);   // an empty cloud is published on purpose: Nav2 uses it for clearing
 }
 
 #ifdef COLOR_OCTOMAP_SERVER

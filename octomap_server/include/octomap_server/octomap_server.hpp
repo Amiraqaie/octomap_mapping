@@ -167,7 +167,10 @@ protected:
   void publishDelta(const rclcpp::Time & rostime);
   /// something happened that deltas cannot express (reset, clear_bbox, file load)
   void bumpDeltaEpoch();
-
+  /// keep only the points whose WORLD height is inside the nav2 z range, publish them
+  /// unchanged (same frame, stamp and fields) on `pub`
+  void cropCloudForNav2(
+    const PointCloud2 & in, const rclcpp::Publisher<PointCloud2>::SharedPtr & pub);
   /**
   * @brief update occupancy map with a scan labeled as ground and nonground.
   * The scans should be in the global map frame.
@@ -305,6 +308,20 @@ protected:
   double slice_min_z_{0.0};
   double slice_max_z_{0.0};
   bool slice_valid_{false};
+
+  // --- z-cropped clouds for nav2 ---
+  bool nav2_enabled_{false};
+  bool nav2_crop_relative_to_odom_{true};
+  double nav2_z_offset_min_{-0.3};
+  double nav2_z_offset_max_{0.3};
+  double nav2_min_z_{-100.0};
+  double nav2_max_z_{100.0};
+  double odom_z_{0.0};            // latest odometry height in the world frame
+  bool odom_valid_{false};
+  rclcpp::Subscription<PointCloud2>::SharedPtr nav2_global_sub_;
+  rclcpp::Subscription<PointCloud2>::SharedPtr nav2_local_sub_;
+  rclcpp::Publisher<PointCloud2>::SharedPtr nav2_global_pub_;
+  rclcpp::Publisher<PointCloud2>::SharedPtr nav2_local_pub_;
 
   // --- change tracking (added / removed / changed voxels) ---
   bool publish_delta_{false};

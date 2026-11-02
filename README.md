@@ -19,6 +19,8 @@ This fork changes how `octomap_server` publishes its outputs:
 3. **Map changes are published incrementally** as three point clouds (added, removed, changed
    voxels), so an external node can keep its own copy of the map up to date without receiving the
    whole map every time.
+4. **Height-cropped point clouds for Nav2**: up to two input clouds (for example the SLAM cloud and the
+   sensor cloud) are cropped in height and republished, one for the global and one for the local costmap.
 
 Everything new is opt-in. With `dynamic_z_range:=false` and `publish_delta:=false` the node behaves
 as before, except for point 1.
@@ -40,8 +42,15 @@ ros2 run octomap_server octomap_server_node --ros-args \
   -p occupancy_z_offset_min:=-0.3 \
   -p occupancy_z_offset_max:=0.3 \
   -p publish_delta:=true \
-  -p delta_changed_min_logodds:=1.0
+  -p delta_changed_min_logodds:=1.0 \
+  -p nav2_global_cloud_in:=/cloud_registered \
+  -p nav2_local_cloud_in:=/cloud_registered_body \
+  -p nav2_z_offset_min:=-0.3 \
+  -p nav2_z_offset_max:=0.5
 ```
+
+`/cloud_registered` (frame `camera_init`) and `/cloud_registered_body` (body frame) are the FAST-LIO names;
+check your own with `ros2 topic list`.
 
 Check the executable name of your build with `ros2 pkg executables octomap_server`.
 
@@ -86,6 +95,11 @@ Note: The extension of octomap path should be `.bt` or `.ot`
 | `occupancy_z_offset_max` | double | `0.3` | Upper edge of the slice, relative to the odometry height [m]. |
 | `publish_delta` | bool | `false` | Publish the added / removed / changed clouds. Can be changed at runtime. |
 | `delta_changed_min_logodds` | double | `0.0` | A voxel that stays occupied is reported as changed only if its log-odds moved by more than this. |
+| `nav2_global_cloud_in` | string | `""` | Input cloud for the global costmap output. Empty disables it. Read at startup only. |
+| `nav2_local_cloud_in` | string | `""` | Input cloud for the local costmap output. Empty disables it. Read at startup only. |
+| `nav2_crop_relative_to_odom` | bool | `true` | Crop relative to the odometry height (`true`) or with absolute world heights (`false`). |
+| `nav2_z_offset_min` / `nav2_z_offset_max` | double | `-0.3` / `0.3` | Crop limits relative to the odometry height [m]. |
+| `nav2_min_z` / `nav2_max_z` | double | `-100.0` / `100.0` | Absolute crop limits in `frame_id` [m], used when `nav2_crop_relative_to_odom` is `false`. |
 
 Existing parameters keep their meaning. `occupancy_min_z` and `occupancy_max_z` are still used for the
 2D projection when `dynamic_z_range` is `false`, and until the first odometry message has arrived.
@@ -100,6 +114,8 @@ Existing parameters keep their meaning. `occupancy_min_z` and `occupancy_max_z` 
 | `octomap_delta_removed` | `sensor_msgs/PointCloud2` (XYZI) | Voxels that are no longer occupied. |
 | `octomap_delta_changed` | `sensor_msgs/PointCloud2` (XYZI) | Voxels that stay occupied but whose log-odds changed by more than `delta_changed_min_logodds`. |
 | `octomap_delta_epoch` | `std_msgs/UInt32` (latched) | Increments when the map was reset, partly cleared or loaded from a file. |
+| `nav2_global_cloud` | `sensor_msgs/PointCloud2` | `nav2_global_cloud_in`, cropped in height. For the Nav2 global costmap. |
+| `nav2_local_cloud` | `sensor_msgs/PointCloud2` | `nav2_local_cloud_in`, cropped in height. For the Nav2 local costmap. |
 
 ### Delta clouds
 
@@ -120,6 +136,53 @@ Existing parameters keep their meaning. `occupancy_min_z` and `occupancy_max_z` 
 3. If `octomap_delta_epoch` changes, drop your map and start again from step 1 with the next
    `octomap_binary` message. This happens after `~/reset`, `~/clear_bbox` and loading a file, which
    cannot be expressed as deltas.
+
+### Cropped clouds for Nav2
+
+* The height test is done in `frame_id`, so a body-frame cloud is cropped by its real height and not by
+  its tilted body z. This needs a tf transform from the cloud frame to `frame_id`. If the exact stamp is
+  not available, the latest transform is used.
+* The output keeps the **frame, stamp and all fields** of its input. Only points are removed. A body-frame
+  input therefore stays a body-frame output, which is what the Nav2 obstacle layer needs for raytracing.
+* In the default mode the limits are `odom_z + nav2_z_offset_min` .. `odom_z + nav2_z_offset_max`. Until the first
+  odometry message arrives, nothing is published in this mode.
+* The x, y, z fields must be float32. Nothing is computed while an output has no subscriber.
+* An empty result is still published, because Nav2 uses empty clouds for clearing.
+* The two inputs can be the same topic.
+* Suggested use: the SLAM cloud for the global costmap (marking only), the sensor cloud for the local
+  costmap (marking and clearing).
+
+Nav2 configuration (obstacle layer):
+
+```yaml
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      obstacle_layer:
+        observation_sources: pointcloud
+        pointcloud:
+          topic: /nav2_global_cloud
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          min_obstacle_height: -10.0
+          max_obstacle_height: 10.0
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      obstacle_layer:
+        observation_sources: pointcloud
+        pointcloud:
+          topic: /nav2_local_cloud
+          data_type: PointCloud2
+          marking: true
+          clearing: true
+          min_obstacle_height: -10.0
+          max_obstacle_height: 10.0
+```
+
+The height limits are wide on purpose: the crop is already done by the server, and Nav2 measures these
+limits in its own global frame, whose z may differ from `frame_id`.
 
 ### Behavior notes
 
