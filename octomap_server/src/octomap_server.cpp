@@ -125,6 +125,10 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   nav2_enabled_ = !nav2_global_in.empty() || !nav2_local_in.empty();
 
   publish_delta_ = declare_parameter("publish_delta", false);
+
+  publish_scan_free_ = declare_parameter("publish_scan_free", false);
+  scan_free_stride_ = std::max<int>(1, declare_parameter("scan_free_stride", 1));
+
   delta_changed_min_logodds_ = declare_parameter("delta_changed_min_logodds", 0.0);
   min_x_size_ = declare_parameter("min_x_size", 0.0);
   min_y_size_ = declare_parameter("min_y_size", 0.0);
@@ -320,6 +324,8 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   delta_added_pub_ = create_publisher<PointCloud2>("octomap_delta_added", rclcpp::QoS(10));
   delta_removed_pub_ = create_publisher<PointCloud2>("octomap_delta_removed", rclcpp::QoS(10));
   delta_changed_pub_ = create_publisher<PointCloud2>("octomap_delta_changed", rclcpp::QoS(10));
+  scan_free_marker_pub_ = create_publisher<MarkerArray>("scan_free_cells_vis_array", rclcpp::QoS(1));
+  scan_free_cloud_pub_ = create_publisher<PointCloud2>("scan_free_point_cloud_centers", rclcpp::QoS(1));
   delta_epoch_pub_ = create_publisher<std_msgs::msg::UInt32>(
     "octomap_delta_epoch", rclcpp::QoS{1}.transient_local());
   {
@@ -535,6 +541,9 @@ void OctomapServer::insertCloudCallback(const PointCloud2::ConstSharedPtr cloud)
   tf2::Vector3 sensor_to_world_vec3{t.x, t.y, t.z};
   insertScan(sensor_to_world_vec3, pc_ground, pc_nonground);
 
+  insertScan(sensor_to_world_vec3, pc_ground, pc_nonground);
+  publishScanFree(cloud->header.stamp);   // NEW
+
   double total_elapsed = (rclcpp::Clock{}.now() - start_time).seconds();
   RCLCPP_DEBUG(
     get_logger(),
@@ -542,6 +551,62 @@ void OctomapServer::insertCloudCallback(const PointCloud2::ConstSharedPtr cloud)
     pc_ground.size(), pc_nonground.size(), total_elapsed);
 
   publishAll(cloud->header.stamp);
+}
+
+bool OctomapServer::scanFreeWanted() const
+{
+  return publish_scan_free_ &&
+         (scan_free_marker_pub_->get_subscription_count() +
+          scan_free_marker_pub_->get_intra_process_subscription_count() +
+          scan_free_cloud_pub_->get_subscription_count() +
+          scan_free_cloud_pub_->get_intra_process_subscription_count() > 0);
+}
+
+void OctomapServer::publishScanFree(const rclcpp::Time & stamp)
+{
+  if (!scanFreeWanted()) {
+    return;
+  }
+  const unsigned stride = static_cast<unsigned>(scan_free_stride_);
+
+  pcl::PointCloud<pcl::PointXYZ> cloud_pcl;
+  visualization_msgs::msg::Marker marker;
+  marker.header.frame_id = world_frame_id_;
+  marker.header.stamp = stamp;
+  marker.ns = "scan_free";
+  marker.id = 0;
+  marker.type = visualization_msgs::msg::Marker::CUBE_LIST;
+  marker.scale.x = marker.scale.y = marker.scale.z = res_ * stride;
+  marker.color = color_free_;
+  marker.pose.orientation.w = 1.0;
+
+  for (const auto & key : scan_free_keys_) {
+    if (stride > 1 &&
+      (key[0] % stride != 0 || key[1] % stride != 0 || key[2] % stride != 0))
+    {
+      continue;
+    }
+    const octomap::point3d c = octree_->keyToCoord(key);
+    cloud_pcl.push_back(pcl::PointXYZ(
+      static_cast<float>(c.x()), static_cast<float>(c.y()), static_cast<float>(c.z())));
+    geometry_msgs::msg::Point p;
+    p.x = c.x();
+    p.y = c.y();
+    p.z = c.z();
+    marker.points.push_back(p);
+  }
+  marker.action = marker.points.empty() ?
+    visualization_msgs::msg::Marker::DELETE : visualization_msgs::msg::Marker::ADD;
+
+  MarkerArray arr;
+  arr.markers.push_back(marker);
+  scan_free_marker_pub_->publish(arr);
+
+  PointCloud2 msg;
+  pcl::toROSMsg(cloud_pcl, msg);
+  msg.header.frame_id = world_frame_id_;
+  msg.header.stamp = stamp;
+  scan_free_cloud_pub_->publish(msg);
 }
 
 void OctomapServer::insertScan(
@@ -621,10 +686,21 @@ void OctomapServer::insertScan(
   // CHANGED: decide once per scan whether changes are recorded
   const bool track_delta = deltaWanted();
 
+  // CHANGED: decide once per scan whether changes are recorded
+  const bool track_delta = deltaWanted();
+  const bool collect_scan_free = scanFreeWanted();
+  scan_free_keys_.clear();
+  if (collect_scan_free) {
+    scan_free_keys_.reserve(free_cells.size());
+  }
+
   // mark free cells only if not seen occupied in this cloud
   for (auto it = free_cells.begin(), end = free_cells.end(); it != end; ++it) {
     if (occupied_cells.find(*it) == occupied_cells.end()) {
       updateNodeTracked(*it, false, track_delta);
+      if (collect_scan_free) {
+        scan_free_keys_.push_back(*it);
+      }
     }
   }
 
@@ -1467,6 +1543,9 @@ rcl_interfaces::msg::SetParametersResult OctomapServer::onParameter(
   update_param(parameters, "nav2_z_offset_max", nav2_z_offset_max_);
   update_param(parameters, "nav2_min_z", nav2_min_z_);
   update_param(parameters, "nav2_max_z", nav2_max_z_);
+  update_param(parameters, "publish_scan_free", publish_scan_free_);
+  update_param(parameters, "scan_free_stride", scan_free_stride_);
+  scan_free_stride_ = std::max(1, scan_free_stride_);
   double sensor_model_min{get_parameter("sensor_model.min").as_double()};
   update_param(parameters, "sensor_model.min", sensor_model_min);
   octree_->setClampingThresMin(sensor_model_min);
