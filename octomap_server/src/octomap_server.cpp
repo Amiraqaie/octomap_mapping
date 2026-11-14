@@ -685,9 +685,6 @@ void OctomapServer::insertScan(
 
   // CHANGED: decide once per scan whether changes are recorded
   const bool track_delta = deltaWanted();
-
-  // CHANGED: decide once per scan whether changes are recorded
-  const bool track_delta = deltaWanted();
   const bool collect_scan_free = scanFreeWanted();
   scan_free_keys_.clear();
   if (collect_scan_free) {
