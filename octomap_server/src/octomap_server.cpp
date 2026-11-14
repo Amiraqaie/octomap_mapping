@@ -314,6 +314,7 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   binary_map_pub_ = create_publisher<Octomap>("octomap_binary", qos);
   full_map_pub_ = create_publisher<Octomap>("octomap_full", qos);
   point_cloud_pub_ = create_publisher<PointCloud2>("octomap_point_cloud_centers", qos);
+  free_point_cloud_pub_ = create_publisher<PointCloud2>("octomap_free_point_cloud_centers", qos);  // NEW
   map_pub_ = create_publisher<OccupancyGrid>("projected_map", qos.keep_last(5));
   fmarker_pub_ = create_publisher<MarkerArray>("free_cells_vis_array", qos);
   delta_added_pub_ = create_publisher<PointCloud2>("octomap_delta_added", rclcpp::QoS(10));
@@ -707,6 +708,11 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
     (latched_topics_ ||
     point_cloud_pub_->get_subscription_count() +
     point_cloud_pub_->get_intra_process_subscription_count() > 0);
+  bool publish_free_point_cloud =
+    publish_free_space_ &&
+    (latched_topics_ ||
+    free_point_cloud_pub_->get_subscription_count() +
+    free_point_cloud_pub_->get_intra_process_subscription_count() > 0);
   bool publish_binary_map =
     (latched_topics_ ||
     binary_map_pub_->get_subscription_count() +
@@ -734,6 +740,9 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
 
   // init pointcloud:
   pcl::PointCloud<PCLPoint> pcl_cloud;
+
+  // free-space centers are always plain XYZ (a free voxel has no color)
+  pcl::PointCloud<pcl::PointXYZ> pcl_free_cloud;
 
   // call pre-traversal hook:
   handlePreNodeTraversal(rostime);
@@ -833,29 +842,34 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
         pcl_cloud.push_back(PCLPoint(x, y, z));
 #endif
       }
-    } else {  // node not occupied => mark as free in 2D map if unknown so far
-      if (in_slice) {                                   // CHANGED
+    } else {  // node not occupied
+      // 2D projection: only inside the (possibly dynamic) z slice
+      if (in_slice) {
         handleFreeNode(it);
         if (in_update_bbox) {
           handleFreeNodeInBBX(it);
         }
+      }
 
-        if (publish_free_space_) {
-          double x = it.getX();
-          double y = it.getY();
+      // 3D free-space outputs: NOT sliced, same z range as the occupied markers
+      if (publish_free_space_) {
+        const double x = it.getX();
+        const double y = it.getY();
 
-          // create marker for free space:
-          if (publish_free_marker_array_) {
-            unsigned idx = it.getDepth();
-            assert(idx < free_nodes_vis.markers.size());
+        if (publish_free_marker_array_) {
+          unsigned idx = it.getDepth();
+          assert(idx < free_nodes_vis.markers.size());
 
-            geometry_msgs::msg::Point cube_center;
-            cube_center.x = x;
-            cube_center.y = y;
-            cube_center.z = z;
+          geometry_msgs::msg::Point cube_center;
+          cube_center.x = x;
+          cube_center.y = y;
+          cube_center.z = z;
+          free_nodes_vis.markers[idx].points.push_back(cube_center);
+        }
 
-            free_nodes_vis.markers[idx].points.push_back(cube_center);
-          }
+        if (publish_free_point_cloud) {
+          pcl_free_cloud.push_back(pcl::PointXYZ(
+            static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
         }
       }
     }
@@ -929,6 +943,14 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
 
   if (publish_binary_map) {
     publishBinaryOctoMap(rostime);
+  }
+
+  if (publish_free_point_cloud) {
+    PointCloud2 free_cloud;
+    pcl::toROSMsg(pcl_free_cloud, free_cloud);
+    free_cloud.header.frame_id = world_frame_id_;
+    free_cloud.header.stamp = rostime;
+    free_point_cloud_pub_->publish(free_cloud);
   }
 
   if (publish_full_map) {

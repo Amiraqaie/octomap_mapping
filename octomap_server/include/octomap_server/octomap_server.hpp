@@ -260,6 +260,7 @@ protected:
   rclcpp::Publisher<Octomap>::SharedPtr binary_map_pub_;
   rclcpp::Publisher<Octomap>::SharedPtr full_map_pub_;
   rclcpp::Publisher<PointCloud2>::SharedPtr point_cloud_pub_;
+  rclcpp::Publisher<PointCloud2>::SharedPtr free_point_cloud_pub_;   // NEW
   rclcpp::Publisher<OccupancyGrid>::SharedPtr map_pub_;
   rclcpp::Publisher<MarkerArray>::SharedPtr fmarker_pub_;
   message_filters::Subscriber<PointCloud2> point_cloud_sub_;
