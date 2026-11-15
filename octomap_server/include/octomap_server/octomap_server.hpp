@@ -62,7 +62,12 @@
 #include "octomap_msgs/srv/get_octomap.hpp"
 #include "octomap_msgs/srv/bounding_box_query.hpp"
 #include "octomap_msgs/conversions.h"
-
+#include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+#include <builtin_interfaces/msg/time.hpp>
+#include <geometry_msgs/msg/point.hpp>
 #include "octomap_ros/conversions.hpp"
 
 
@@ -367,6 +372,35 @@ protected:
   unsigned multires_2d_scale_;
   bool project_complete_map_;
   bool use_colored_map_;
+
+  // Dedicated scan-free publishing thread
+  struct ScanFreeFrame
+  {
+      std::vector<geometry_msgs::msg::Point> points;
+      builtin_interfaces::msg::Time stamp;
+  };
+
+  std::mutex scan_free_queue_mutex_;
+  std::condition_variable scan_free_queue_cv_;
+
+  ScanFreeFrame pending_scan_free_;
+  bool scan_free_pending_{false};
+  bool scan_free_worker_stop_{false};
+
+  std::thread scan_free_worker_;
+
+  void scanFreePublishLoop();
+
+  void enqueueScanFree(
+      const rclcpp::Time & stamp);
+
+  void publishScanFreeFrame(
+      const ScanFreeFrame & frame);
+
+  public:
+
+  ~OctomapServer();
+
 };
 }  // namespace octomap_server
 
