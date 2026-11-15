@@ -334,11 +334,6 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
     delta_epoch_pub_->publish(epoch_msg);
   }
 
-  scan_free_worker_ =
-      std::thread(
-          &OctomapServer::scanFreePublishLoop,
-          this);
-
   tf2_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   auto timer_interface = std::make_shared<tf2_ros::CreateTimerROS>(
     this->get_node_base_interface(),
@@ -396,22 +391,6 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   if (!openFile(filename)) {
     RCLCPP_WARN(get_logger(), "Could not open file %s", filename.c_str());
   }
-}
-
-OctomapServer::~OctomapServer()
-{
-    {
-        std::lock_guard<std::mutex> lock(
-            scan_free_queue_mutex_);
-
-        scan_free_worker_stop_ = true;
-    }
-
-    scan_free_queue_cv_.notify_one();
-
-    if (scan_free_worker_.joinable()) {
-        scan_free_worker_.join();
-    }
 }
 
 bool OctomapServer::openFile(const std::string & filename)
@@ -582,143 +561,51 @@ bool OctomapServer::scanFreeWanted() const
           scan_free_cloud_pub_->get_intra_process_subscription_count() > 0);
 }
 
-void OctomapServer::enqueueScanFree(
-    const rclcpp::Time & stamp)
+void OctomapServer::publishScanFree(const rclcpp::Time & stamp)
 {
-    if (!scanFreeWanted()) {
-        return;
-    }
+  if (!scanFreeWanted()) {
+    return;
+  }
+  const unsigned stride = static_cast<unsigned>(scan_free_stride_);
 
-    const unsigned stride =
-        static_cast<unsigned>(scan_free_stride_);
+  pcl::PointCloud<pcl::PointXYZ> cloud_pcl;
+  visualization_msgs::msg::Marker marker;
+  marker.header.frame_id = world_frame_id_;
+  marker.header.stamp = stamp;
+  marker.ns = "scan_free";
+  marker.id = 0;
+  marker.type = visualization_msgs::msg::Marker::CUBE_LIST;
+  marker.scale.x = marker.scale.y = marker.scale.z = res_ * stride;
+  marker.color = color_free_;
+  marker.pose.orientation.w = 1.0;
 
-    ScanFreeFrame frame;
-    frame.stamp = stamp;
-
-    frame.points.reserve(scan_free_keys_.size());
-
-    for (const auto & key : scan_free_keys_) {
-
-        if (stride > 1 &&
-            (key[0] % stride != 0 ||
-             key[1] % stride != 0 ||
-             key[2] % stride != 0))
-        {
-            continue;
-        }
-
-        const octomap::point3d c =
-            octree_->keyToCoord(key);
-
-        geometry_msgs::msg::Point p;
-
-        p.x = c.x();
-        p.y = c.y();
-        p.z = c.z();
-
-        frame.points.push_back(p);
-    }
-
+  for (const auto & key : scan_free_keys_) {
+    if (stride > 1 &&
+      (key[0] % stride != 0 || key[1] % stride != 0 || key[2] % stride != 0))
     {
-        std::lock_guard<std::mutex> lock(
-            scan_free_queue_mutex_);
-
-        // Latest-frame policy:
-        // Replace an unpublished old frame.
-        pending_scan_free_ = std::move(frame);
-
-        scan_free_pending_ = true;
+      continue;
     }
+    const octomap::point3d c = octree_->keyToCoord(key);
+    cloud_pcl.push_back(pcl::PointXYZ(
+      static_cast<float>(c.x()), static_cast<float>(c.y()), static_cast<float>(c.z())));
+    geometry_msgs::msg::Point p;
+    p.x = c.x();
+    p.y = c.y();
+    p.z = c.z();
+    marker.points.push_back(p);
+  }
+  marker.action = marker.points.empty() ?
+    visualization_msgs::msg::Marker::DELETE : visualization_msgs::msg::Marker::ADD;
 
-    scan_free_queue_cv_.notify_one();
-}
+  MarkerArray arr;
+  arr.markers.push_back(marker);
+  scan_free_marker_pub_->publish(arr);
 
-void OctomapServer::scanFreePublishLoop()
-{
-    while (true)
-    {
-        ScanFreeFrame frame;
-
-        {
-            std::unique_lock<std::mutex> lock(
-                scan_free_queue_mutex_);
-
-            scan_free_queue_cv_.wait(
-                lock,
-                [this]() {
-                    return scan_free_pending_ ||
-                           scan_free_worker_stop_;
-                });
-
-            if (scan_free_worker_stop_) {
-                break;
-            }
-
-            frame = std::move(pending_scan_free_);
-
-            scan_free_pending_ = false;
-        }
-
-        publishScanFreeFrame(frame);
-    }
-}
-
-void OctomapServer::publishScanFreeFrame(
-    const ScanFreeFrame & frame)
-{
-    const size_t count = frame.points.size();
-
-    pcl::PointCloud<pcl::PointXYZ> pcl_cloud;
-    pcl_cloud.points.reserve(count);
-
-    visualization_msgs::msg::Marker marker;
-
-    marker.header.frame_id = world_frame_id_;
-    marker.header.stamp = frame.stamp;
-
-    marker.ns = "scan_free";
-    marker.id = 0;
-
-    marker.type =
-        visualization_msgs::msg::Marker::CUBE_LIST;
-
-    marker.scale.x = res_ * scan_free_stride_;
-    marker.scale.y = res_ * scan_free_stride_;
-    marker.scale.z = res_ * scan_free_stride_;
-
-    marker.color = color_free_;
-    marker.pose.orientation.w = 1.0;
-
-    marker.points.reserve(count);
-
-    for (const auto & p : frame.points)
-    {
-        pcl_cloud.push_back(
-            pcl::PointXYZ(
-                static_cast<float>(p.x),
-                static_cast<float>(p.y),
-                static_cast<float>(p.z)));
-
-        marker.points.push_back(p);
-    }
-
-    marker.action = marker.points.empty() ?
-        visualization_msgs::msg::Marker::DELETE :
-        visualization_msgs::msg::Marker::ADD;
-
-    MarkerArray arr;
-    arr.markers.push_back(std::move(marker));
-
-    scan_free_marker_pub_->publish(arr);
-
-    PointCloud2 msg;
-
-    pcl::toROSMsg(pcl_cloud, msg);
-
-    msg.header.frame_id = world_frame_id_;
-    msg.header.stamp = frame.stamp;
-
-    scan_free_cloud_pub_->publish(msg);
+  PointCloud2 msg;
+  pcl::toROSMsg(cloud_pcl, msg);
+  msg.header.frame_id = world_frame_id_;
+  msg.header.stamp = stamp;
+  scan_free_cloud_pub_->publish(msg);
 }
 
 void OctomapServer::insertScan(
