@@ -9,7 +9,7 @@ endif()
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
-
+find_package(OpenMP)
 find_package(PCL REQUIRED)
 include_directories(${PCL_INCLUDE_DIRS})
 
@@ -132,3 +132,14 @@ install(PROGRAMS
   scripts/octomap_eraser_cli.py
   DESTINATION lib/${PROJECT_NAME}
 )
+
+
+add_executable(scan_free_node src/scan_free_node.cpp)
+ament_target_dependencies(scan_free_node
+  rclcpp sensor_msgs octomap tf2 tf2_ros tf2_eigen)
+target_link_libraries(scan_free_node ${OCTOMAP_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(scan_free_node OpenMP::OpenMP_CXX)
+endif()
+
+install(TARGETS scan_free_node DESTINATION lib/${PROJECT_NAME})
