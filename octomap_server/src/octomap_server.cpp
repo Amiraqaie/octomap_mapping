@@ -126,8 +126,8 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
 
   publish_delta_ = declare_parameter("publish_delta", false);
 
-  publish_scan_free_ = declare_parameter("publish_scan_free", false);
-  scan_free_stride_ = std::max<int>(1, declare_parameter("scan_free_stride", 1));
+  // publish_scan_free_ = declare_parameter("publish_scan_free", false);
+  // scan_free_stride_ = std::max<int>(1, declare_parameter("scan_free_stride", 1));
 
   delta_changed_min_logodds_ = declare_parameter("delta_changed_min_logodds", 0.0);
   min_x_size_ = declare_parameter("min_x_size", 0.0);
@@ -324,8 +324,8 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   delta_added_pub_ = create_publisher<PointCloud2>("octomap_delta_added", rclcpp::QoS(10));
   delta_removed_pub_ = create_publisher<PointCloud2>("octomap_delta_removed", rclcpp::QoS(10));
   delta_changed_pub_ = create_publisher<PointCloud2>("octomap_delta_changed", rclcpp::QoS(10));
-  scan_free_marker_pub_ = create_publisher<MarkerArray>("scan_free_cells_vis_array", rclcpp::QoS(1));
-  scan_free_cloud_pub_ = create_publisher<PointCloud2>("scan_free_point_cloud_centers", rclcpp::QoS(1));
+  // scan_free_marker_pub_ = create_publisher<MarkerArray>("scan_free_cells_vis_array", rclcpp::QoS(1));
+  // scan_free_cloud_pub_ = create_publisher<PointCloud2>("scan_free_point_cloud_centers", rclcpp::QoS(1));
   delta_epoch_pub_ = create_publisher<std_msgs::msg::UInt32>(
     "octomap_delta_epoch", rclcpp::QoS{1}.transient_local());
   {
