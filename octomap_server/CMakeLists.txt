@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.5)
 project(octomap_server)
 
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 17)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   set(CMAKE_CXX_EXTENSIONS OFF)
 endif()
@@ -10,6 +10,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+find_package(OpenMP)
 find_package(PCL REQUIRED)
 include_directories(${PCL_INCLUDE_DIRS})
 
@@ -17,6 +18,9 @@ find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 find_package(OCTOMAP REQUIRED)
 
+# ---------------------------------------------------------------
+# octomap_server_static
+# ---------------------------------------------------------------
 ament_auto_add_library(octomap_server_static SHARED
   src/octomap_server_static.cpp
 )
@@ -36,6 +40,9 @@ rclcpp_components_register_node(octomap_server_static
   EXECUTABLE octomap_server_static_node
 )
 
+# ---------------------------------------------------------------
+# octomap_server
+# ---------------------------------------------------------------
 ament_auto_add_library(octomap_server SHARED
   src/octomap_server.cpp
 )
@@ -58,6 +65,9 @@ rclcpp_components_register_node(octomap_server
   EXECUTABLE octomap_server_node
 )
 
+# ---------------------------------------------------------------
+# octomap_server_multilayer
+# ---------------------------------------------------------------
 ament_auto_add_library(octomap_server_multilayer SHARED
   src/octomap_server.cpp
   src/octomap_server_multilayer.cpp
@@ -73,6 +83,9 @@ rclcpp_components_register_node(octomap_server_multilayer
   EXECUTABLE octomap_server_multilayer_node
 )
 
+# ---------------------------------------------------------------
+# tracking_octomap_server
+# ---------------------------------------------------------------
 ament_auto_add_library(tracking_octomap_server SHARED
   src/octomap_server.cpp
   src/tracking_octomap_server.cpp
@@ -88,6 +101,9 @@ rclcpp_components_register_node(tracking_octomap_server
   EXECUTABLE tracking_octomap_server_node
 )
 
+# ---------------------------------------------------------------
+# color_octomap_server
+# ---------------------------------------------------------------
 ament_auto_add_library(color_octomap_server SHARED
   src/octomap_server.cpp
 )
@@ -104,6 +120,9 @@ rclcpp_components_register_node(color_octomap_server
 
 target_compile_definitions(color_octomap_server PUBLIC COLOR_OCTOMAP_SERVER)
 
+# ---------------------------------------------------------------
+# octomap_saver
+# ---------------------------------------------------------------
 ament_auto_add_library(octomap_saver SHARED
   src/octomap_saver.cpp
 )
@@ -117,11 +136,47 @@ rclcpp_components_register_node(octomap_saver
   EXECUTABLE octomap_saver_node
 )
 
+# ---------------------------------------------------------------
+# scan_free_node (standalone per-scan free-space publisher)
+# ---------------------------------------------------------------
+add_executable(scan_free_node src/scan_free_node.cpp)
+
+ament_target_dependencies(scan_free_node
+  rclcpp
+  sensor_msgs
+  tf2
+  tf2_ros
+  tf2_eigen
+)
+
+target_include_directories(scan_free_node
+  PRIVATE
+    ${OCTOMAP_INCLUDE_DIRS}
+)
+
+target_link_libraries(scan_free_node
+  ${OCTOMAP_LIBRARIES}
+)
+
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(scan_free_node OpenMP::OpenMP_CXX)
+endif()
+
+install(TARGETS scan_free_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# ---------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+# ---------------------------------------------------------------
+# Package
+# ---------------------------------------------------------------
 ament_auto_package(
   INSTALL_TO_SHARE
     launch

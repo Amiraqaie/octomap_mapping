@@ -260,6 +260,7 @@ protected:
   rclcpp::Publisher<Octomap>::SharedPtr binary_map_pub_;
   rclcpp::Publisher<Octomap>::SharedPtr full_map_pub_;
   rclcpp::Publisher<PointCloud2>::SharedPtr point_cloud_pub_;
+  rclcpp::Publisher<PointCloud2>::SharedPtr free_point_cloud_pub_;   // NEW
   rclcpp::Publisher<OccupancyGrid>::SharedPtr map_pub_;
   rclcpp::Publisher<MarkerArray>::SharedPtr fmarker_pub_;
   message_filters::Subscriber<PointCloud2> point_cloud_sub_;
@@ -270,6 +271,15 @@ protected:
   rclcpp::Service<ResetSrv>::SharedPtr reset_srv_;
   std::shared_ptr<tf2_ros::Buffer> tf2_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf2_listener_;
+
+  // --- free space of the latest scan only ---
+  // bool publish_scan_free_{false};
+  // int scan_free_stride_{1};                         // keep every Nth voxel per axis (1 = all)
+  // std::vector<octomap::OcTreeKey> scan_free_keys_;  // filled by insertScan()
+  // rclcpp::Publisher<MarkerArray>::SharedPtr scan_free_marker_pub_;
+  // rclcpp::Publisher<PointCloud2>::SharedPtr scan_free_cloud_pub_;
+  // bool scanFreeWanted() const;
+  // void publishScanFree(const rclcpp::Time & stamp);
 
   std::unique_ptr<OcTreeT> octree_;
   octomap::KeyRay key_ray_;  // temp storage for ray casting
