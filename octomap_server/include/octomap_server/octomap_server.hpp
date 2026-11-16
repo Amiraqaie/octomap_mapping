@@ -318,7 +318,7 @@ protected:
   double nav2_max_z_{100.0};
   double odom_z_{0.0};            // latest odometry height in the world frame
   bool odom_valid_{false};
-  rclcpp::Subscription<PointCloud2>::SharedPtr nav2_global_sub_;
+  // rclcpp::Subscription<PointCloud2>::SharedPtr nav2_global_sub_;
   rclcpp::Subscription<PointCloud2>::SharedPtr nav2_local_sub_;
   rclcpp::Publisher<PointCloud2>::SharedPtr nav2_global_pub_;
   rclcpp::Publisher<PointCloud2>::SharedPtr nav2_local_pub_;

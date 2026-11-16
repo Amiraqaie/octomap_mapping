@@ -115,14 +115,14 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   occupancy_z_offset_min_ = declare_parameter("occupancy_z_offset_min", -0.3);
   occupancy_z_offset_max_ = declare_parameter("occupancy_z_offset_max", 0.3);
   const std::string odom_topic = declare_parameter("odom_topic", "/Odometry");
-  const std::string nav2_global_in = declare_parameter("nav2_global_cloud_in", "");
+  // const std::string nav2_global_in = declare_parameter("nav2_global_cloud_in", "");
   const std::string nav2_local_in = declare_parameter("nav2_local_cloud_in", "");
   nav2_crop_relative_to_odom_ = declare_parameter("nav2_crop_relative_to_odom", true);
   nav2_z_offset_min_ = declare_parameter("nav2_z_offset_min", -0.3);
   nav2_z_offset_max_ = declare_parameter("nav2_z_offset_max", 0.3);
   nav2_min_z_ = declare_parameter("nav2_min_z", -100.0);
   nav2_max_z_ = declare_parameter("nav2_max_z", 100.0);
-  nav2_enabled_ = !nav2_global_in.empty() || !nav2_local_in.empty();
+  nav2_enabled_ = true;
 
   publish_delta_ = declare_parameter("publish_delta", false);
   delta_changed_min_logodds_ = declare_parameter("delta_changed_min_logodds", 0.0);
@@ -341,13 +341,13 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
     "nav2_global_cloud", rclcpp::SensorDataQoS().reliable());
   nav2_local_pub_ = create_publisher<PointCloud2>(
     "nav2_local_cloud", rclcpp::SensorDataQoS().reliable());
-  if (!nav2_global_in.empty()) {
-    nav2_global_sub_ = create_subscription<PointCloud2>(
-      nav2_global_in, rclcpp::SensorDataQoS(),
-      [this](const PointCloud2::ConstSharedPtr msg) {
-        cropCloudForNav2(*msg, nav2_global_pub_);
-      });
-  }
+  // if (!nav2_global_in.empty()) {
+  //   nav2_global_sub_ = create_subscription<PointCloud2>(
+  //     nav2_global_in, rclcpp::SensorDataQoS(),
+  //     [this](const PointCloud2::ConstSharedPtr msg) {
+  //       cropCloudForNav2(*msg, nav2_global_pub_);
+  //     });
+  // }
   if (!nav2_local_in.empty()) {
     nav2_local_sub_ = create_subscription<PointCloud2>(
       nav2_local_in, rclcpp::SensorDataQoS(),
@@ -706,7 +706,9 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
   bool publish_point_cloud =
     (latched_topics_ ||
     point_cloud_pub_->get_subscription_count() +
-    point_cloud_pub_->get_intra_process_subscription_count() > 0);
+    point_cloud_pub_->get_intra_process_subscription_count() +
+    nav2_global_pub_->get_subscription_count() +
+    nav2_global_pub_->get_intra_process_subscription_count() > 0);
   bool publish_binary_map =
     (latched_topics_ ||
     binary_map_pub_->get_subscription_count() +
@@ -924,7 +926,12 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
     pcl::toROSMsg(pcl_cloud, cloud);
     cloud.header.frame_id = world_frame_id_;
     cloud.header.stamp = rostime;
+
+    // Original OctoMap point cloud
     point_cloud_pub_->publish(cloud);
+
+    // Directly generate Nav2 global cloud from the same OctoMap cloud
+    cropCloudForNav2(cloud, nav2_global_pub_);
   }
 
   if (publish_binary_map) {
