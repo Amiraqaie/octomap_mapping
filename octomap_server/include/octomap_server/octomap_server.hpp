@@ -66,14 +66,7 @@
 #include "octomap_ros/conversions.hpp"
 
 
-// switch color here - easier maintenance, only maintain OctomapServer.
-// Two targets are defined in the cmake, octomap_server_color and octomap_server.
-// One has this defined, and the other doesn't
-// #define COLOR_OCTOMAP_SERVER
-
-#ifdef COLOR_OCTOMAP_SERVER
 #include <octomap/ColorOcTree.h>
-#endif
 
 #include <algorithm>
 #include <memory>
@@ -93,19 +86,25 @@ using sensor_msgs::msg::PointCloud2;
 using std_msgs::msg::ColorRGBA;
 using visualization_msgs::msg::MarkerArray;
 
+struct DeltaPoint
+{
+  float x, y, z, intensity;
+  PCL_ADD_RGB;
+};
+}  // namespace octomap_server
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(octomap_server::DeltaPoint,
+  (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(float, rgb, rgb))
+
+namespace octomap_server
+{
 class OctomapServer : public rclcpp::Node
 {
 public:
-#ifdef COLOR_OCTOMAP_SERVER
   using PCLPoint = pcl::PointXYZRGB;
   using PCLPointCloud = pcl::PointCloud<pcl::PointXYZRGB>;
   using OcTreeT = octomap::ColorOcTree;
-#else
-  using PCLPoint = pcl::PointXYZ;
-  using PCLPointCloud = pcl::PointCloud<pcl::PointXYZ>;
-  using OcTreeT = octomap::OcTree;
-#endif
-  using DeltaPointCloud = pcl::PointCloud<pcl::PointXYZI>;
+  using DeltaPointCloud = pcl::PointCloud<DeltaPoint>;
   using OctomapSrv = octomap_msgs::srv::GetOctomap;
   using BBoxSrv = octomap_msgs::srv::BoundingBoxQuery;
   using ResetSrv = std_srvs::srv::Empty;
@@ -162,7 +161,8 @@ protected:
   void publishFullOctoMap(const rclcpp::Time & rostime) const;
   virtual void publishAll(const rclcpp::Time & rostime);
   /// update one voxel; when `track` is set, record added / removed / changed voxels
-  void updateNodeTracked(const octomap::OcTreeKey & key, bool occupied, bool track);
+  void updateNodeTracked(const octomap::OcTreeKey & key, bool occupied, bool track,
+    const octomap::ColorOcTreeNode::Color * color = nullptr);
   bool deltaWanted() const;
   void publishDelta(const rclcpp::Time & rostime);
   /// something happened that deltas cannot express (reset, clear_bbox, file load)

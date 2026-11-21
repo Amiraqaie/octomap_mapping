@@ -22,8 +22,13 @@ This fork changes how `octomap_server` publishes its outputs:
 4. **Height-cropped point clouds for Nav2**: up to two input clouds (for example the SLAM cloud and the
    sensor cloud) are cropped in height and republished, one for the global and one for the local costmap.
 
-Everything new is opt-in. With `dynamic_z_range:=false` and `publish_delta:=false` the node behaves
-as before, except for point 1.
+5. **Point clouds carry RGB.** The server reads packed `rgb` or `rgba` from
+   `cloud_in` and honors FAST-LIVO's optional `has_color` flag. Each voxel takes
+   the mean of its valid endpoint colors from the latest scan that observed color.
+   Removed voxels retain their last color. Free space without a surface observation,
+   including the standalone per-scan free cloud, appears white. Use RViz's
+   **RGB8** color transformer to display these colors. Full maps use
+   `ColorOcTree` and preserve color in `.ot` files. Binary maps store occupancy only.
 
 ### Usage
 
@@ -94,7 +99,7 @@ Note: The extension of octomap path should be `.bt` or `.ot`
 | `occupancy_z_offset_min` | double | `-0.3` | Lower edge of the slice, relative to the odometry height [m]. |
 | `occupancy_z_offset_max` | double | `0.3` | Upper edge of the slice, relative to the odometry height [m]. |
 | `publish_delta` | bool | `false` | Publish the added / removed / changed clouds. Can be changed at runtime. |
-| `delta_changed_min_logodds` | double | `0.0` | A voxel that stays occupied is reported as changed only if its log-odds moved by more than this. |
+| `delta_changed_min_logodds` | double | `0.0` | Minimum log-odds change for an occupied voxel with unchanged RGB. |
 | `nav2_global_cloud_in` | string | `""` | Input cloud for the global costmap output. Empty disables it. Read at startup only. |
 | `nav2_local_cloud_in` | string | `""` | Input cloud for the local costmap output. Empty disables it. Read at startup only. |
 | `nav2_crop_relative_to_odom` | bool | `true` | Crop relative to the odometry height (`true`) or with absolute world heights (`false`). |
@@ -110,9 +115,9 @@ Existing parameters keep their meaning. `occupancy_min_z` and `occupancy_max_z` 
 |---|---|---|
 | `octomap_point_cloud_centers` | `sensor_msgs/PointCloud2` | Occupied voxels of the whole map, all heights. |
 | `projected_map` | `nav_msgs/OccupancyGrid` | 2D projection of the height slice only. |
-| `octomap_delta_added` | `sensor_msgs/PointCloud2` (XYZI) | Voxels that became occupied. |
-| `octomap_delta_removed` | `sensor_msgs/PointCloud2` (XYZI) | Voxels that are no longer occupied. |
-| `octomap_delta_changed` | `sensor_msgs/PointCloud2` (XYZI) | Voxels that stay occupied but whose log-odds changed by more than `delta_changed_min_logodds`. |
+| `octomap_delta_added` | `sensor_msgs/PointCloud2` (XYZ, intensity, rgb) | Voxels that became occupied. |
+| `octomap_delta_removed` | `sensor_msgs/PointCloud2` (XYZ, intensity, rgb) | Voxels that are no longer occupied. |
+| `octomap_delta_changed` | `sensor_msgs/PointCloud2` (XYZ, intensity, rgb) | Occupied voxels whose RGB changed or whose log-odds changed by more than `delta_changed_min_logodds`. |
 | `octomap_delta_epoch` | `std_msgs/UInt32` (latched) | Increments when the map was reset, partly cleared or loaded from a file. |
 | `nav2_global_cloud` | `sensor_msgs/PointCloud2` | `nav2_global_cloud_in`, cropped in height. For the Nav2 global costmap. |
 | `nav2_local_cloud` | `sensor_msgs/PointCloud2` | `nav2_local_cloud_in`, cropped in height. For the Nav2 local costmap. |

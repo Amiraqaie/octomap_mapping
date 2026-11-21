@@ -29,7 +29,9 @@
 #include <octomap_server/octomap_server.hpp>
 
 #include <algorithm>
+#include <array>
 #include <limits>
+#include <unordered_map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +42,41 @@
 
 namespace
 {
+bool hasPackedColor(const sensor_msgs::msg::PointCloud2 & cloud)
+{
+  return std::any_of(cloud.fields.begin(), cloud.fields.end(), [](const auto & f) {
+    return f.count == 1 && ((f.name == "rgb" && (f.datatype == f.FLOAT32 || f.datatype == f.UINT32)) ||
+           (f.name == "rgba" && f.datatype == f.UINT32));
+  });
+}
+
+// Import the original occupancy-only .ot format without expanding its pruned leaves.
+class ImportedColorTree : public octomap::ColorOcTree
+{
+public:
+  explicit ImportedColorTree(const octomap::OcTree & source)
+  : ColorOcTree(source.getResolution())
+  {
+    if (source.getRoot()) {
+      root = new octomap::ColorOcTreeNode;
+      ++tree_size;
+      copyNode(source, source.getRoot(), root);
+    }
+  }
+
+private:
+  void copyNode(const octomap::OcTree & source, const octomap::OcTreeNode * from,
+    octomap::ColorOcTreeNode * to)
+  {
+    to->setLogOdds(from->getLogOdds());
+    for (unsigned i = 0; i < 8; ++i) {
+      if (source.nodeChildExists(from, i)) {
+        copyNode(source, source.getNodeChild(from, i), createNodeChild(to, i));
+      }
+    }
+  }
+};
+
 template<typename T>
 bool update_param(const std::vector<rclcpp::Parameter> & p, const std::string & name, T & value)
 {
@@ -116,7 +153,8 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   occupancy_z_offset_max_ = declare_parameter("occupancy_z_offset_max", 0.3);
   const std::string odom_topic = declare_parameter("odom_topic", "/Odometry");
   // const std::string nav2_global_in = declare_parameter("nav2_global_cloud_in", "");
-  const std::string nav2_local_in = declare_parameter("nav2_local_cloud_in", "");
+  // const std::string nav2_local_in = declare_parameter("nav2_local_cloud_in", "");
+  const std::string nav2_local_in = "cloud_in";
   nav2_crop_relative_to_odom_ = declare_parameter("nav2_crop_relative_to_odom", true);
   nav2_z_offset_min_ = declare_parameter("nav2_z_offset_min", -0.3);
   nav2_z_offset_max_ = declare_parameter("nav2_z_offset_max", 0.3);
@@ -258,14 +296,7 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   }
 
   if (use_colored_map_) {
-#ifdef COLOR_OCTOMAP_SERVER
     RCLCPP_INFO_STREAM(get_logger(), "Using RGB color registration (if information available)");
-#else
-    RCLCPP_ERROR_STREAM(
-      get_logger(),
-      "Colored map requested in launch file - node not running/compiled to support colors, "
-      "please define COLOR_OCTOMAP_SERVER and recompile or launch the octomap_color_server node");
-#endif
   }
 
   // initialize octomap object & params
@@ -409,11 +440,13 @@ bool OctomapServer::openFile(const std::string & filename)
     if (!tree) {
       return false;
     }
-    octree_ = std::unique_ptr<OcTreeT>(dynamic_cast<OcTreeT *>(tree.release()));
-    if (!octree_) {
-      RCLCPP_ERROR(
-        get_logger(),
-        "Could not read OcTree in file, currently there are no other types supported in .ot");
+    if (auto colored = dynamic_cast<OcTreeT *>(tree.get())) {
+      tree.release();
+      octree_.reset(colored);
+    } else if (auto plain = dynamic_cast<octomap::OcTree *>(tree.get())) {
+      octree_ = std::make_unique<ImportedColorTree>(*plain);
+    } else {
+      RCLCPP_ERROR(get_logger(), "Unsupported OctoMap tree type: %s", tree->getTreeType().c_str());
       return false;
     }
 
@@ -460,7 +493,21 @@ void OctomapServer::insertCloudCallback(const PointCloud2::ConstSharedPtr cloud)
   // ground filtering in base frame
   //
   PCLPointCloud pc;  // input cloud for filtering and ground-detection
-  pcl::fromROSMsg(*cloud, pc);
+  if (hasPackedColor(*cloud)) {
+    pcl::fromROSMsg(*cloud, pc);
+    const auto valid = std::find_if(cloud->fields.begin(), cloud->fields.end(), [&cloud](const auto & f) {
+      return f.name == "has_color" && f.datatype == f.UINT8 && f.offset < cloud->point_step;
+    });
+    for (size_t i = 0; i < pc.size(); ++i) {
+      const auto offset = (i / cloud->width) * cloud->row_step + (i % cloud->width) * cloud->point_step;
+      pc[i].a = valid == cloud->fields.end() || cloud->data[offset + valid->offset] ? 255 : 0;
+    }
+  } else {
+    pcl::PointCloud<pcl::PointXYZ> xyz;
+    pcl::fromROSMsg(*cloud, xyz);
+    pcl::copyPointCloud(xyz, pc);
+    for (auto & point : pc) {point.a = 0;}
+  }
 
   geometry_msgs::msg::TransformStamped sensor_to_world_transform_stamped;
   try {
@@ -622,6 +669,8 @@ void OctomapServer::insertScan(
 
   // instead of direct scan insertion, compute update to filter ground:
   octomap::KeySet free_cells, occupied_cells;
+  struct ColorSum {uint64_t r{}, g{}, b{}, count{};};
+  std::unordered_map<octomap::OcTreeKey, ColorSum, octomap::OcTreeKey::KeyHash> colors;
   // insert ground points only as free:
   for (PCLPointCloud::const_iterator it = ground.begin(); it != ground.end(); ++it) {
     octomap::point3d point(it->x, it->y, it->z);
@@ -661,9 +710,13 @@ void OctomapServer::insertScan(
         updateMinKey(key, update_bbox_min_);
         updateMaxKey(key, update_bbox_max_);
 
-#ifdef COLOR_OCTOMAP_SERVER  // NB: Only read and interpret color if it's an occupied node
-        octree_->averageNodeColor(it->x, it->y, it->z, /*r=*/ it->r, /*g=*/ it->g, /*b=*/ it->b);
-#endif
+        if (it->a) {
+          auto & sum = colors[key];
+          sum.r += it->r;
+          sum.g += it->g;
+          sum.b += it->b;
+          ++sum.count;
+        }
       }
     } else {  // ray longer than maxrange
       octomap::point3d new_end = sensor_origin + (point - sensor_origin).normalized() * max_range_;
@@ -711,7 +764,15 @@ void OctomapServer::insertScan(
 
   // now mark all occupied cells:
   for (auto it = occupied_cells.begin(), end = occupied_cells.end(); it != end; it++) {
-    updateNodeTracked(*it, true, track_delta);
+    auto sample = colors.find(*it);
+    if (sample == colors.end()) {
+      updateNodeTracked(*it, true, track_delta);
+    } else {
+      const auto & sum = sample->second;
+      const octomap::ColorOcTreeNode::Color color(
+        sum.r / sum.count, sum.g / sum.count, sum.b / sum.count);
+      updateNodeTracked(*it, true, track_delta, &color);
+    }
   }
 
   // TODO(someone): eval lazy+updateInner vs. proper insertion
@@ -825,7 +886,7 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
   pcl::PointCloud<PCLPoint> pcl_cloud;
 
   // free-space centers are always plain XYZ (a free voxel has no color)
-  pcl::PointCloud<pcl::PointXYZ> pcl_free_cloud;
+  PCLPointCloud pcl_free_cloud;
 
   // call pre-traversal hook:
   handlePreNodeTraversal(rostime);
@@ -849,11 +910,9 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
     if (octree_->isNodeOccupied(*it)) {
       double x = it.getX();
       double y = it.getY();
-#ifdef COLOR_OCTOMAP_SERVER
       int r = it->getColor().r;
       int g = it->getColor().g;
       int b = it->getColor().b;
-#endif
 
       // Ignore speckles in the map:
       if (filter_speckles_ && (it.getDepth() == tree_depth_ + 1) && isSpeckleNode(it.getKey())) {
@@ -897,7 +956,6 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
           occupied_nodes_vis.markers[idx].colors.push_back(heightMapColor(h));
         }
 
-#ifdef COLOR_OCTOMAP_SERVER
         if (use_colored_map_) {
           ColorRGBA _color;
           _color.r = (r / 255.);
@@ -907,12 +965,10 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
           _color.a = 1.0;
           occupied_nodes_vis.markers[idx].colors.push_back(_color);
         }
-#endif
       }
 
       // insert into pointcloud:
       if (publish_point_cloud) {
-#ifdef COLOR_OCTOMAP_SERVER
         PCLPoint _point = PCLPoint();
         _point.x = x;
         _point.y = y;
@@ -921,9 +977,6 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
         _point.g = g;
         _point.b = b;
         pcl_cloud.push_back(_point);
-#else
-        pcl_cloud.push_back(PCLPoint(x, y, z));
-#endif
       }
     } else {  // node not occupied
       // 2D projection: only inside the (possibly dynamic) z slice
@@ -951,8 +1004,8 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
         }
 
         if (publish_free_point_cloud) {
-          pcl_free_cloud.push_back(pcl::PointXYZ(
-            static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)));
+          const auto color = it->getColor();
+          pcl_free_cloud.push_back(PCLPoint(x, y, z, color.r, color.g, color.b));
         }
       }
     }
@@ -1061,6 +1114,7 @@ bool OctomapServer::onOctomapBinarySrv(
     return false;
   }
 
+  res->map.id = "OcTree";  // Binary payload contains occupancy only.
   double total_elapsed = (rclcpp::Clock{}.now() - start_time).seconds();
   RCLCPP_INFO(get_logger(), "Binary octomap sent in %f sec", total_elapsed);
   return true;
@@ -1157,6 +1211,7 @@ void OctomapServer::publishBinaryOctoMap(const rclcpp::Time & rostime) const
   map.header.frame_id = world_frame_id_;
   map.header.stamp = rostime;
   if (octomap_msgs::binaryMapToMsg(*octree_, map)) {
+    map.id = "OcTree";
     binary_map_pub_->publish(map);
   } else {
     RCLCPP_ERROR(get_logger(), "Error serializing OctoMap");
@@ -1717,9 +1772,10 @@ bool OctomapServer::deltaWanted() const
 }
 
 void OctomapServer::updateNodeTracked(
-  const octomap::OcTreeKey & key, bool occupied, bool track)
+  const octomap::OcTreeKey & key, bool occupied, bool track,
+  const octomap::ColorOcTreeNode::Color * color)
 {
-  if (!track) {
+  if (!track && !color) {
     octree_->updateNode(key, occupied);
     return;
   }
@@ -1729,13 +1785,37 @@ void OctomapServer::updateNodeTracked(
   const bool was_occupied = (old_node != nullptr) && octree_->isNodeOccupied(old_node);
   const float old_logodds = (old_node != nullptr) ? old_node->getLogOdds() : 0.0f;
 
+  const auto old_color = old_node ? old_node->getColor() : octomap::ColorOcTreeNode::Color();
   const auto new_node = octree_->updateNode(key, occupied);
   if (new_node == nullptr) {
     return;
   }
   const bool is_occupied = octree_->isNodeOccupied(new_node);
 
-  pcl::PointXYZI p;
+  auto voxel_color = old_color;
+  if (color) {
+    voxel_color = *color;
+    if (new_node->getColor() != voxel_color) {
+      // updateNode may return a pruned ancestor. Color only this endpoint.
+      std::array<octomap::ColorOcTreeNode *, 16> parents;
+      auto node = octree_->getRoot();
+      for (unsigned depth = 0; depth < tree_depth_; ++depth) {
+        parents[depth] = node;
+        if (!octree_->nodeHasChildren(node)) {octree_->expandNode(node);}
+        node = octree_->getNodeChild(node, octomap::computeChildIdx(key, tree_depth_ - depth - 1));
+      }
+      node->setColor(voxel_color);
+      for (unsigned depth = tree_depth_; depth > 0; --depth) {
+        parents[depth - 1]->updateColorChildren();
+      }
+    }
+  }
+  if (!track) {return;}
+
+  DeltaPoint p{};
+  p.r = voxel_color.r;
+  p.g = voxel_color.g;
+  p.b = voxel_color.b;
   const octomap::point3d c = octree_->keyToCoord(key);   // centre of the finest voxel
   p.x = c.x();
   p.y = c.y();
@@ -1747,7 +1827,8 @@ void OctomapServer::updateNodeTracked(
   } else if (was_occupied && !is_occupied) {
     delta_removed_.push_back(p);
   } else if (was_occupied && is_occupied &&
-    std::abs(new_node->getLogOdds() - old_logodds) > delta_changed_min_logodds_)
+    (voxel_color != old_color ||
+    std::abs(new_node->getLogOdds() - old_logodds) > delta_changed_min_logodds_))
   {
     delta_changed_.push_back(p);
   }
@@ -1843,6 +1924,16 @@ void OctomapServer::cropCloudForNav2(
   out.fields = in.fields;
   out.is_bigendian = in.is_bigendian;
   out.point_step = in.point_step;
+  const bool append_rgb = !hasPackedColor(in);
+  if (append_rgb) {
+    sensor_msgs::msg::PointField field;
+    field.name = "rgb";
+    field.offset = out.point_step;
+    field.datatype = field.FLOAT32;
+    field.count = 1;
+    out.fields.push_back(field);
+    out.point_step += sizeof(float);
+  }
   out.height = 1;
   out.is_dense = true;             // NaN points never pass the test below
 
@@ -1859,6 +1950,11 @@ void OctomapServer::cropCloudForNav2(
       }
       const uint8_t * p = in.data.data() + i * in.point_step;
       out.data.insert(out.data.end(), p, p + in.point_step);
+      if (append_rgb) {
+        if (out.is_bigendian) {out.data.push_back(0);}
+        out.data.insert(out.data.end(), 3, 255);
+        if (!out.is_bigendian) {out.data.push_back(0);}
+      }
       ++kept;
     }
   } catch (const std::runtime_error & e) {
@@ -1872,14 +1968,7 @@ void OctomapServer::cropCloudForNav2(
   pub->publish(out);   // an empty cloud is published on purpose: Nav2 uses it for clearing
 }
 
-#ifdef COLOR_OCTOMAP_SERVER
-using ColorOctomapServer = OctomapServer;
-#endif
 }  // namespace octomap_server
 
 #include <rclcpp_components/register_node_macro.hpp>
-#ifdef COLOR_OCTOMAP_SERVER
-RCLCPP_COMPONENTS_REGISTER_NODE(octomap_server::ColorOctomapServer)
-#else
 RCLCPP_COMPONENTS_REGISTER_NODE(octomap_server::OctomapServer)
-#endif

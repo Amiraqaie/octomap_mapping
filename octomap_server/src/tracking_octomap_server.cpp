@@ -79,18 +79,22 @@ void TrackingOctomapServer::trackChanges()
   auto start_pnt = octree_->changedKeysBegin();
   auto end_pnt = octree_->changedKeysEnd();
 
-  pcl::PointCloud<pcl::PointXYZI> changed_cells = pcl::PointCloud<pcl::PointXYZI>();
+  DeltaPointCloud changed_cells;
 
   int c = 0;
   for (auto iter = start_pnt; iter != end_pnt; ++iter) {
     ++c;
-    octomap::OcTreeNode * node = octree_->search(iter->first);
+    auto * node = octree_->search(iter->first);
 
     bool occupied = octree_->isNodeOccupied(node);
 
     octomap::point3d center = octree_->keyToCoord(iter->first);
 
-    pcl::PointXYZI pnt;
+    DeltaPoint pnt{};
+    const auto color = node->getColor();
+    pnt.r = color.r;
+    pnt.g = color.g;
+    pnt.b = color.b;
     pnt.x = center(0);
     pnt.y = center(1);
     pnt.z = center(2);
@@ -121,13 +125,19 @@ void TrackingOctomapServer::trackChanges()
 
 void TrackingOctomapServer::trackCallback(const PointCloud2::ConstSharedPtr cloud)
 {
-  pcl::PointCloud<pcl::PointXYZI> cells;
+  DeltaPointCloud cells;
   pcl::fromROSMsg(*cloud, cells);
   RCLCPP_DEBUG(get_logger(), "[client] size of newly occupied cloud: %zu", cells.points.size());
 
+  const bool has_rgb = std::any_of(cloud->fields.begin(), cloud->fields.end(),
+    [](const auto & field) {return field.name == "rgb";});
   for (size_t i = 0; i < cells.points.size(); ++i) {
-    pcl::PointXYZI & pnt = cells.points[i];
-    octree_->updateNode(octree_->coordToKey(pnt.x, pnt.y, pnt.z), pnt.intensity, false);
+    const auto & pnt = cells.points[i];
+    const auto key = octree_->coordToKey(pnt.x, pnt.y, pnt.z);
+    const auto * previous = octree_->search(key);
+    const float log_odds = previous ? previous->getLogOdds() : 0.0f;
+    auto * node = octree_->setNodeValue(key, log_odds + pnt.intensity, true);
+    if (has_rgb) {node->setColor(pnt.r, pnt.g, pnt.b);}
   }
 
   octree_->updateInnerOccupancy();

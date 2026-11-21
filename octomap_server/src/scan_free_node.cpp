@@ -135,17 +135,21 @@ private:
     msg.header.frame_id = world_frame_;
     msg.header.stamp = cloud->header.stamp;
     sensor_msgs::PointCloud2Modifier mod(msg);
-    mod.setPointCloud2FieldsByString(1, "xyz");
+    mod.setPointCloud2FieldsByString(2, "xyz", "rgb");
     mod.resize(result.size());
     sensor_msgs::PointCloud2Iterator<float> ox(msg, "x");
     sensor_msgs::PointCloud2Iterator<float> oy(msg, "y");
     sensor_msgs::PointCloud2Iterator<float> oz(msg, "z");
+    sensor_msgs::PointCloud2Iterator<uint8_t> red(msg, "r"), green(msg, "g"), blue(msg, "b");
     for (const uint64_t v : result) {
       octomap::OcTreeKey k(
         static_cast<uint16_t>(v & 0xFFFF), static_cast<uint16_t>((v >> 16) & 0xFFFF),
         static_cast<uint16_t>((v >> 32) & 0xFFFF));
       const octomap::point3d c = tree_->keyToCoord(k);
       *ox = c.x(); *oy = c.y(); *oz = c.z();
+      // Traversed space has no measured surface color.
+      *red = *green = *blue = 255;
+      ++red; ++green; ++blue;
       ++ox; ++oy; ++oz;
     }
     pub_->publish(msg);
